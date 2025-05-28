@@ -1,482 +1,483 @@
 """
-Command-line interface for the FixTester framework.
+Command-line interface for FixTester providing easy access to testing functionality.
 """
-import json
 import os
 import sys
 import time
+import json
+import yaml
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import click
-import yaml
 
 from fixtester.core.engine import FixEngine
 from fixtester.core.message_factory import MessageFactory
+from fixtester.core.validator import MessageValidator
 from fixtester.utils.config_loader import ConfigLoader
+from fixtester.utils.logger import setup_logger
 
 
 @click.group()
-@click.version_option(version="0.1.0")
-def cli():
-    """FixTester - Automated FIX Protocol Testing Framework."""
-    pass
+@click.option('--config', '-c', default='config/default.yaml', help='Configuration file path')
+@click.option('--verbose', '-v', is_flag=True, help='Enable verbose output')
+@click.pass_context
+def main(ctx, config, verbose):
+    """FixTester - Automated FIX Protocol Testing Framework"""
+    ctx.ensure_object(dict)
+    ctx.obj['config_path'] = config
+    ctx.obj['verbose'] = verbose
+    
+    # Setup logging
+    log_config = {'level': 'DEBUG' if verbose else 'INFO'}
+    ctx.obj['logger'] = setup_logger('fixtester.cli', log_config)
 
 
-@cli.command("start-engine")
-@click.option("--config", "-c", default="config/default.yaml", help="Path to configuration file")
-def start_engine(config):
-    """Start the FIX engine with the given configuration."""
+@main.command()
+@click.option('--scenario', '-s', required=True, help='Path to scenario configuration file')
+@click.option('--timeout', '-t', default=30.0, help='Test timeout in seconds')
+@click.option('--output', '-o', help='Output file for test results')
+@click.pass_context
+def run_scenario(ctx, scenario, timeout, output):
+    """Run a specific test scenario"""
+    logger = ctx.obj['logger']
+    config_path = ctx.obj['config_path']
+    
     try:
-        engine = FixEngine.from_config(config)
+        logger.info(f"Running scenario: {scenario}")
+        
+        # Load main configuration
+        config = ConfigLoader.load(config_path)
+        
+        # Load scenario configuration
+        scenario_config = ConfigLoader.load(scenario)
+        
+        # Create and start the engine
+        engine = FixEngine(config)
         engine.start()
         
-        click.echo(f"Engine started with configuration from {config}")
-        click.echo("Press Ctrl+C to stop...")
+        # Wait for connection
+        logger.info("Waiting for FIX session to establish...")
+        time.sleep(2)
         
-        # Keep the engine running until interrupted
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            click.echo("Stopping engine...")
-            engine.stop()
-            click.echo("Engine stopped.")
-    except Exception as e:
-        click.echo(f"Error starting engine: {e}", err=True)
-        sys.exit(1)
-
-
-@cli.command("run-scenario")
-@click.argument("scenario_file")
-@click.option("--config", "-c", default="config/default.yaml", help="Path to configuration file")
-@click.option("--output", "-o", help="Output file for results")
-@click.option("--timeout", "-t", default=30, help="Timeout in seconds for the scenario")
-def run_scenario(scenario_file, config, output, timeout):
-    """Run a test scenario from a scenario file."""
-    try:
-        # Load the scenario
-        try:
-            with open(scenario_file, 'r') as f:
-                scenario = yaml.safe_load(f)
-        except Exception as e:
-            click.echo(f"Error loading scenario file: {e}", err=True)
+        # Run the scenario
+        results = _run_scenario_tests(engine, scenario_config, timeout)
+        
+        # Stop the engine
+        engine.stop()
+        
+        # Output results
+        if output:
+            _save_results(results, output)
+        else:
+            _print_results(results)
+            
+        # Exit with appropriate code
+        if results['passed']:
+            logger.info("All tests passed!")
+            sys.exit(0)
+        else:
+            logger.error("Some tests failed!")
             sys.exit(1)
             
-        click.echo(f"Running scenario: {scenario.get('name', 'Unnamed')}")
-        
-        # Initialize the engine
-        engine = FixEngine.from_config(config)
-        engine.start()
-        
-        try:
-            # Wait for session establishment
-            if not engine.application.sessions:
-                click.echo("Waiting for session establishment...")
-                if hasattr(engine, "wait_for_logon") and callable(engine.wait_for_logon):
-                    if not engine.wait_for_logon(timeout=10.0):
-                        click.echo("Timed out waiting for session establishment.", err=True)
-                        sys.exit(1)
-                else:
-                    # Sleep a bit to allow session establishment
-                    time.sleep(5)
-            
-            # Create message factory
-            factory = MessageFactory(
-                protocol_version=scenario.get("protocol_version", "FIX.4.4")
-            )
-            
-            # Process scenario steps
-            results = []
-            for i, step in enumerate(scenario.get("steps", [])):
-                step_name = step.get("name", f"Step {i+1}")
-                step_type = step.get("type", "send")
-                
-                click.echo(f"Executing step: {step_name} ({step_type})")
-                
-                if step_type == "send":
-                    # Create and send message
-                    message_type = step.get("message_type")
-                    fields = step.get("fields", {})
-                    
-                    message = factory.create_message(message_type, fields)
-                    
-                    # Send and optionally wait for response
-                    if step.get("wait_for_response", False):
-                        response = engine.send_and_wait(
-                            message, 
-                            timeout=step.get("timeout", 5.0)
-                        )
-                        
-                        if response:
-                            # Validate response if validation rules are provided
-                            validation_result = True
-                            validation_errors = []
-                            if "validation" in step:
-                                validation_result, validation_errors = engine.validator.validate_message(
-                                    response,
-                                    expected_type=step["validation"].get("expected_type"),
-                                    expected_fields=step["validation"].get("expected_fields"),
-                                    extra_rules=step["validation"].get("extra_rules")
-                                )
-                                
-                            # Store result
-                            results.append({
-                                "step": step_name,
-                                "success": validation_result,
-                                "errors": validation_errors,
-                                "response": factory.message_to_dict(response)
-                            })
-                            
-                            if not validation_result:
-                                click.echo(f"Validation failed: {validation_errors}", err=True)
-                                if step.get("fail_on_validation_error", True):
-                                    raise Exception(f"Validation failed for step {step_name}")
-                        else:
-                            click.echo(f"No response received within timeout", err=True)
-                            results.append({
-                                "step": step_name,
-                                "success": False,
-                                "errors": ["No response received within timeout"],
-                                "response": None
-                            })
-                            
-                            if step.get("fail_on_timeout", True):
-                                raise Exception(f"Timeout waiting for response in step {step_name}")
-                    else:
-                        # Just send without waiting for response
-                        success = engine.send_message(message)
-                        results.append({
-                            "step": step_name,
-                            "success": success,
-                            "errors": [] if success else ["Failed to send message"],
-                            "response": None
-                        })
-                        
-                        if not success and step.get("fail_on_send_error", True):
-                            raise Exception(f"Failed to send message in step {step_name}")
-                
-                elif step_type == "wait":
-                    # Just wait for a specified time
-                    wait_time = step.get("time", 1.0)
-                    click.echo(f"Waiting for {wait_time} seconds...")
-                    time.sleep(wait_time)
-                    results.append({
-                        "step": step_name,
-                        "success": True,
-                        "errors": [],
-                        "response": None
-                    })
-                
-                elif step_type == "assert":
-                    # Assert some condition
-                    # TODO: Implement more assertion types
-                    click.echo("Assert step not fully implemented yet")
-                    results.append({
-                        "step": step_name,
-                        "success": True,
-                        "errors": ["Assert step not fully implemented"],
-                        "response": None
-                    })
-                
-                else:
-                    click.echo(f"Unknown step type: {step_type}", err=True)
-                    results.append({
-                        "step": step_name,
-                        "success": False,
-                        "errors": [f"Unknown step type: {step_type}"],
-                        "response": None
-                    })
-            
-            # Prepare scenario results
-            scenario_results = {
-                "name": scenario.get("name", "Unnamed"),
-                "timestamp": time.time(),
-                "success": all(step["success"] for step in results),
-                "steps": results
-            }
-            
-            # Output results
-            if output:
-                with open(output, 'w') as f:
-                    json.dump(scenario_results, f, indent=2)
-                click.echo(f"Results written to {output}")
-            
-            # Print summary
-            click.echo("\nScenario Results:")
-            click.echo(f"  Name: {scenario.get('name', 'Unnamed')}")
-            click.echo(f"  Success: {scenario_results['success']}")
-            click.echo(f"  Steps: {len(results)}")
-            click.echo(f"  Passed: {sum(1 for step in results if step['success'])}")
-            click.echo(f"  Failed: {sum(1 for step in results if not step['success'])}")
-            
-            if not scenario_results['success']:
-                sys.exit(1)
-                
-        finally:
-            # Stop the engine
-            engine.stop()
-            
     except Exception as e:
-        click.echo(f"Error running scenario: {e}", err=True)
+        logger.error(f"Error running scenario: {e}")
         sys.exit(1)
 
 
-@cli.command("run-all-scenarios")
-@click.option("--scenarios-dir", "-d", default="config/scenarios", help="Directory containing scenario files")
-@click.option("--config", "-c", default="config/default.yaml", help="Path to configuration file")
-@click.option("--output-dir", "-o", default="results", help="Output directory for results")
-@click.option("--fail-fast", "-f", is_flag=True, help="Stop after first failing scenario")
-def run_all_scenarios(scenarios_dir, config, output_dir, fail_fast):
-    """Run all test scenarios in the specified directory."""
+@main.command()
+@click.option('--scenarios-dir', '-d', default='config/scenarios', help='Directory containing scenario files')
+@click.option('--timeout', '-t', default=30.0, help='Test timeout in seconds per scenario')
+@click.option('--output', '-o', help='Output file for test results')
+@click.option('--parallel', '-p', is_flag=True, help='Run scenarios in parallel')
+@click.pass_context
+def run_all_scenarios(ctx, scenarios_dir, timeout, output, parallel):
+    """Run all test scenarios in a directory"""
+    logger = ctx.obj['logger']
+    config_path = ctx.obj['config_path']
+    
     try:
-        # Ensure output directory exists
-        os.makedirs(output_dir, exist_ok=True)
-        
         # Find all scenario files
-        scenario_files = []
-        for file in os.listdir(scenarios_dir):
-            if file.endswith((".yaml", ".yml")):
-                scenario_files.append(os.path.join(scenarios_dir, file))
-                
+        scenario_files = list(Path(scenarios_dir).glob('*.yaml'))
         if not scenario_files:
-            click.echo(f"No scenario files found in {scenarios_dir}", err=True)
+            logger.error(f"No scenario files found in {scenarios_dir}")
             sys.exit(1)
             
-        click.echo(f"Found {len(scenario_files)} scenario files")
+        logger.info(f"Found {len(scenario_files)} scenario files")
         
-        # Run each scenario
-        results = []
-        failed = False
+        # Load main configuration
+        config = ConfigLoader.load(config_path)
         
+        all_results = []
+        
+        if parallel:
+            # TODO: Implement parallel execution
+            logger.warning("Parallel execution not yet implemented, running sequentially")
+        
+        # Run scenarios sequentially
         for scenario_file in scenario_files:
-            filename = os.path.basename(scenario_file)
-            output_file = os.path.join(output_dir, f"{os.path.splitext(filename)[0]}_result.json")
+            logger.info(f"Running scenario: {scenario_file.name}")
             
-            click.echo(f"\nRunning scenario file: {filename}")
-            
-            # Run the scenario via the run-scenario command
-            exit_code = os.system(
-                f"{sys.executable} -m fixtester.cli run-scenario "
-                f"{scenario_file} --config {config} --output {output_file}"
-            )
-            
-            success = exit_code == 0
-            results.append({
-                "file": filename,
-                "success": success
-            })
-            
-            if not success:
-                failed = True
-                if fail_fast:
-                    click.echo("Stopping due to scenario failure (--fail-fast enabled)")
-                    break
+            try:
+                # Load scenario configuration
+                scenario_config = ConfigLoader.load(str(scenario_file))
+                
+                # Create and start the engine
+                engine = FixEngine(config)
+                engine.start()
+                
+                # Wait for connection
+                time.sleep(2)
+                
+                # Run the scenario
+                results = _run_scenario_tests(engine, scenario_config, timeout)
+                results['scenario_file'] = str(scenario_file)
+                all_results.append(results)
+                
+                # Stop the engine
+                engine.stop()
+                
+                # Brief pause between scenarios
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Error running scenario {scenario_file.name}: {e}")
+                all_results.append({
+                    'scenario_file': str(scenario_file),
+                    'passed': False,
+                    'error': str(e),
+                    'tests': []
+                })
         
-        # Print overall summary
-        click.echo("\nOverall Results:")
-        click.echo(f"  Total scenarios: {len(results)}")
-        click.echo(f"  Passed: {sum(1 for r in results if r['success'])}")
-        click.echo(f"  Failed: {sum(1 for r in results if not r['success'])}")
+        # Output combined results
+        combined_results = _combine_results(all_results)
         
-        if failed:
-            click.echo("\nFailed scenarios:")
-            for result in results:
-                if not result["success"]:
-                    click.echo(f"  - {result['file']}")
+        if output:
+            _save_results(combined_results, output)
+        else:
+            _print_combined_results(combined_results)
+            
+        # Exit with appropriate code
+        if combined_results['all_passed']:
+            logger.info("All scenarios passed!")
+            sys.exit(0)
+        else:
+            logger.error("Some scenarios failed!")
             sys.exit(1)
             
     except Exception as e:
-        click.echo(f"Error running scenarios: {e}", err=True)
+        logger.error(f"Error running scenarios: {e}")
         sys.exit(1)
 
 
-@cli.command("create-scenario")
-@click.argument("name")
-@click.option("--output", "-o", help="Output file for the new scenario")
-def create_scenario(name, output):
-    """Create a new scenario template."""
-    # Create a basic scenario template
-    scenario = {
-        "name": name,
-        "description": "A test scenario for FIX messages",
-        "protocol_version": "FIX.4.4",
-        "steps": [
-            {
-                "name": "Login",
-                "type": "send",
-                "message_type": "Logon",
-                "fields": {
-                    "HeartBtInt": "30",
-                    "EncryptMethod": "0"
-                },
-                "wait_for_response": True,
-                "timeout": 5.0,
-                "fail_on_timeout": True
-            },
-            {
-                "name": "Send Order",
-                "type": "send",
-                "message_type": "NewOrderSingle",
-                "fields": {
-                    "ClOrdID": "TEST-ORDER-1",
-                    "Symbol": "AAPL",
-                    "Side": "1",
-                    "TransactTime": "",  # Will be filled automatically
-                    "OrderQty": "100",
-                    "OrdType": "2",  # Limit order
-                    "Price": "150.50",
-                    "TimeInForce": "0"  # Day
-                },
-                "wait_for_response": True,
-                "timeout": 5.0,
-                "validation": {
-                    "expected_type": "ExecutionReport",
-                    "expected_fields": {
-                        "OrdStatus": "0"  # New
-                    }
-                }
-            },
-            {
-                "name": "Wait",
-                "type": "wait",
-                "time": 1.0
-            },
-            {
-                "name": "Cancel Order",
-                "type": "send",
-                "message_type": "OrderCancelRequest",
-                "fields": {
-                    "ClOrdID": "TEST-CANCEL-1",
-                    "OrigClOrdID": "TEST-ORDER-1",
-                    "Symbol": "AAPL",
-                    "Side": "1",
-                    "TransactTime": ""  # Will be filled automatically
-                },
-                "wait_for_response": True,
-                "timeout": 5.0,
-                "validation": {
-                    "expected_type": "ExecutionReport",
-                    "expected_fields": {
-                        "ExecType": "4",  # Canceled
-                        "OrdStatus": "4"  # Canceled
-                    }
-                }
-            },
-            {
-                "name": "Logout",
-                "type": "send",
-                "message_type": "Logout",
-                "fields": {},
-                "wait_for_response": True,
-                "timeout": 5.0
-            }
-        ]
+@main.command()
+@click.option('--message-type', '-t', required=True, help='FIX message type (e.g., NewOrderSingle)')
+@click.option('--fields', '-f', help='JSON string of field values')
+@click.option('--template', help='Template name to use')
+@click.option('--validate', '-v', is_flag=True, help='Validate the created message')
+@click.pass_context
+def create_message(ctx, message_type, fields, template, validate):
+    """Create a FIX message and optionally validate it"""
+    logger = ctx.obj['logger']
+    config_path = ctx.obj['config_path']
+    
+    try:
+        # Load configuration
+        config = ConfigLoader.load(config_path)
+        
+        # Create message factory
+        factory = MessageFactory()
+        
+        # Parse fields if provided
+        field_values = {}
+        if fields:
+            field_values = json.loads(fields)
+        
+        # Create message
+        if template:
+            message = factory.create_from_template(template, field_values)
+        else:
+            message = factory.create_message(message_type, field_values)
+        
+        # Print the message
+        click.echo("Created FIX message:")
+        click.echo(str(message))
+        
+        # Validate if requested
+        if validate:
+            validator = MessageValidator(config.get('validation', {}))
+            report = validator.validate_message(message, message_type)
+            
+            click.echo("\nValidation Report:")
+            click.echo(f"Valid: {report.is_valid}")
+            click.echo(f"Errors: {report.errors_count}")
+            click.echo(f"Warnings: {report.warnings_count}")
+            
+            if report.issues:
+                click.echo("\nIssues:")
+                for issue in report.issues:
+                    click.echo(f"  {issue.level.value.upper()}: {issue.message}")
+        
+    except Exception as e:
+        logger.error(f"Error creating message: {e}")
+        sys.exit(1)
+
+
+@main.command()
+@click.option('--message', '-m', required=True, help='FIX message string to validate')
+@click.option('--expected-type', help='Expected message type')
+@click.pass_context
+def validate_message(ctx, message, expected_type):
+    """Validate a FIX message string"""
+    logger = ctx.obj['logger']
+    config_path = ctx.obj['config_path']
+    
+    try:
+        # Load configuration
+        config = ConfigLoader.load(config_path)
+        
+        # Parse the message string
+        # TODO: Implement FIX message parsing from string
+        click.echo("Message validation from string not yet implemented")
+        
+    except Exception as e:
+        logger.error(f"Error validating message: {e}")
+        sys.exit(1)
+
+
+@main.command()
+@click.option('--host', default='localhost', help='FIX server host')
+@click.option('--port', default=9878, help='FIX server port')
+@click.option('--sender-comp-id', default='CLIENT', help='Sender CompID')
+@click.option('--target-comp-id', default='SERVER', help='Target CompID')
+@click.option('--duration', default=60, help='Test duration in seconds')
+@click.pass_context
+def stress_test(ctx, host, port, sender_comp_id, target_comp_id, duration):
+    """Run stress test against a FIX server"""
+    logger = ctx.obj['logger']
+    config_path = ctx.obj['config_path']
+    
+    try:
+        # Load configuration
+        config = ConfigLoader.load(config_path)
+        
+        # Override connection settings
+        config['fix']['connection']['host'] = host
+        config['fix']['connection']['port'] = port
+        config['fix']['connection']['sender_comp_id'] = sender_comp_id
+        config['fix']['connection']['target_comp_id'] = target_comp_id
+        
+        logger.info(f"Starting stress test against {host}:{port} for {duration} seconds")
+        
+        # Create and start the engine
+        engine = FixEngine(config)
+        engine.start()
+        
+        # Wait for connection
+        time.sleep(2)
+        
+        # Run stress test
+        _run_stress_test(engine, duration)
+        
+        # Stop the engine
+        engine.stop()
+        
+        logger.info("Stress test completed")
+        
+    except Exception as e:
+        logger.error(f"Error running stress test: {e}")
+        sys.exit(1)
+
+
+@main.command()
+@click.pass_context
+def list_templates(ctx):
+    """List available message templates"""
+    try:
+        factory = MessageFactory()
+        templates = factory.get_available_templates()
+        
+        if templates:
+            click.echo("Available templates:")
+            for template in templates:
+                click.echo(f"  - {template}")
+        else:
+            click.echo("No templates found")
+            
+    except Exception as e:
+        click.echo(f"Error listing templates: {e}")
+        sys.exit(1)
+
+
+@main.command()
+@click.pass_context
+def list_message_types(ctx):
+    """List supported FIX message types"""
+    try:
+        factory = MessageFactory()
+        message_types = factory.get_supported_message_types()
+        
+        click.echo("Supported message types:")
+        for msg_type in message_types:
+            click.echo(f"  - {msg_type}")
+            
+    except Exception as e:
+        click.echo(f"Error listing message types: {e}")
+        sys.exit(1)
+
+
+def _run_scenario_tests(engine: FixEngine, scenario_config: Dict, timeout: float) -> Dict:
+    """Run tests defined in a scenario configuration"""
+    results = {
+        'passed': True,
+        'tests': [],
+        'start_time': time.time(),
+        'end_time': None
     }
     
-    # Determine output file if not provided
-    if not output:
-        safe_name = name.lower().replace(" ", "_")
-        output = f"config/scenarios/{safe_name}.yaml"
-        
-    # Ensure directory exists
-    os.makedirs(os.path.dirname(output), exist_ok=True)
+    tests = scenario_config.get('tests', [])
+    factory = MessageFactory()
     
-    # Write scenario to file
-    with open(output, 'w') as f:
-        yaml.dump(scenario, f, default_flow_style=False, sort_keys=False)
+    for i, test in enumerate(tests):
+        test_name = test.get('name', f'Test {i+1}')
+        test_result = {
+            'name': test_name,
+            'passed': False,
+            'error': None,
+            'duration': 0
+        }
         
-    click.echo(f"Created scenario template: {output}")
-
-
-@cli.command("list-scenarios")
-@click.option("--dir", "-d", default="config/scenarios", help="Directory containing scenario files")
-def list_scenarios(dir):
-    """List available test scenarios."""
-    try:
-        if not os.path.exists(dir):
-            click.echo(f"Scenarios directory not found: {dir}", err=True)
-            sys.exit(1)
+        start_time = time.time()
+        
+        try:
+            # Create the test message
+            message_type = test['message_type']
+            fields = test.get('fields', {})
+            message = factory.create_message(message_type, fields)
             
-        scenario_files = []
-        for file in os.listdir(dir):
-            if file.endswith((".yaml", ".yml")):
-                scenario_files.append(file)
+            # Send the message and wait for response
+            response = engine.send_and_wait(message, timeout)
+            
+            if response:
+                # Validate response if validation rules are provided
+                validation_rules = test.get('validation', {})
+                if validation_rules:
+                    validator = MessageValidator()
+                    report = validator.validate_message(response)
+                    test_result['passed'] = report.is_valid
+                    if not report.is_valid:
+                        test_result['error'] = f"Validation failed: {report.issues[0].message if report.issues else 'Unknown error'}"
+                else:
+                    test_result['passed'] = True
+            else:
+                test_result['error'] = "No response received"
                 
-        if not scenario_files:
-            click.echo(f"No scenario files found in {dir}")
-            return
+        except Exception as e:
+            test_result['error'] = str(e)
+        
+        test_result['duration'] = time.time() - start_time
+        results['tests'].append(test_result)
+        
+        if not test_result['passed']:
+            results['passed'] = False
+    
+    results['end_time'] = time.time()
+    return results
+
+
+def _run_stress_test(engine: FixEngine, duration: int) -> None:
+    """Run a stress test for the specified duration"""
+    factory = MessageFactory()
+    end_time = time.time() + duration
+    message_count = 0
+    
+    while time.time() < end_time:
+        try:
+            # Create a new order single message
+            message = factory.create_new_order_single(
+                cl_ord_id=f"stress_{message_count}",
+                symbol="TEST",
+                side="1",
+                order_qty=100,
+                ord_type="2",
+                price=100.0
+            )
             
-        click.echo(f"Found {len(scenario_files)} scenario files:")
-        
-        for file in sorted(scenario_files):
-            try:
-                with open(os.path.join(dir, file), 'r') as f:
-                    scenario = yaml.safe_load(f)
-                    name = scenario.get("name", "Unnamed")
-                    description = scenario.get("description", "No description")
-                    step_count = len(scenario.get("steps", []))
-                    protocol = scenario.get("protocol_version", "Unknown")
-                    
-                    click.echo(f"  - {file}")
-                    click.echo(f"      Name: {name}")
-                    click.echo(f"      Description: {description}")
-                    click.echo(f"      Steps: {step_count}")
-                    click.echo(f"      Protocol: {protocol}")
-                    click.echo("")
-            except Exception as e:
-                click.echo(f"  - {file} [Error: {e}]")
-                
-    except Exception as e:
-        click.echo(f"Error listing scenarios: {e}", err=True)
-        sys.exit(1)
-
-
-@cli.command("validate-config")
-@click.argument("config_file")
-def validate_config(config_file):
-    """Validate a configuration file."""
-    try:
-        click.echo(f"Validating configuration file: {config_file}")
-        config = ConfigLoader.load(config_file)
-        
-        # Check required sections
-        required_sections = ["fix", "logging"]
-        missing_sections = [section for section in required_sections if section not in config]
-        
-        if missing_sections:
-            click.echo(f"Missing required sections: {', '.join(missing_sections)}", err=True)
-            sys.exit(1)
+            # Send the message (don't wait for response in stress test)
+            engine.send_message(message)
+            message_count += 1
             
-        # Check fix section
-        fix_config = config.get("fix", {})
-        fix_required_fields = ["version", "connection"]
-        missing_fix_fields = [field for field in fix_required_fields if field not in fix_config]
-        
-        if missing_fix_fields:
-            click.echo(f"Missing required fields in fix section: {', '.join(missing_fix_fields)}", err=True)
-            sys.exit(1)
+            # Small delay to avoid overwhelming the server
+            time.sleep(0.01)
             
-        # Check connection section
-        connection = fix_config.get("connection", {})
-        conn_required_fields = ["host", "port", "sender_comp_id", "target_comp_id"]
-        missing_conn_fields = [field for field in conn_required_fields if field not in connection]
+        except Exception as e:
+            print(f"Error sending message {message_count}: {e}")
+    
+    print(f"Sent {message_count} messages in {duration} seconds")
+    print(f"Average rate: {message_count / duration:.2f} messages/second")
+
+
+def _save_results(results: Dict, output_path: str) -> None:
+    """Save test results to a file"""
+    with open(output_path, 'w') as f:
+        json.dump(results, f, indent=2, default=str)
+
+
+def _print_results(results: Dict) -> None:
+    """Print test results to console"""
+    click.echo("\n=== Test Results ===")
+    click.echo(f"Overall: {'PASSED' if results['passed'] else 'FAILED'}")
+    
+    if 'tests' in results:
+        click.echo(f"Tests run: {len(results['tests'])}")
+        click.echo(f"Passed: {sum(1 for t in results['tests'] if t['passed'])}")
+        click.echo(f"Failed: {sum(1 for t in results['tests'] if not t['passed'])}")
         
-        if missing_conn_fields:
-            click.echo(f"Missing required fields in connection section: {', '.join(missing_conn_fields)}", err=True)
-            sys.exit(1)
-            
-        # All checks passed
-        click.echo("Configuration is valid.")
+        for test in results['tests']:
+            status = 'PASS' if test['passed'] else 'FAIL'
+            click.echo(f"  {test['name']}: {status}")
+            if test['error']:
+                click.echo(f"    Error: {test['error']}")
+
+
+def _combine_results(all_results: List[Dict]) -> Dict:
+    """Combine results from multiple scenarios"""
+    combined = {
+        'all_passed': True,
+        'scenarios': all_results,
+        'total_tests': 0,
+        'total_passed': 0,
+        'total_failed': 0
+    }
+    
+    for result in all_results:
+        if not result.get('passed', False):
+            combined['all_passed'] = False
         
-    except Exception as e:
-        click.echo(f"Error validating configuration: {e}", err=True)
-        sys.exit(1)
+        tests = result.get('tests', [])
+        combined['total_tests'] += len(tests)
+        combined['total_passed'] += sum(1 for t in tests if t.get('passed', False))
+        combined['total_failed'] += sum(1 for t in tests if not t.get('passed', False))
+    
+    return combined
 
 
-def main():
-    """Main entry point."""
-    cli()
+def _print_combined_results(results: Dict) -> None:
+    """Print combined results from multiple scenarios"""
+    click.echo("\n=== Combined Test Results ===")
+    click.echo(f"Overall: {'PASSED' if results['all_passed'] else 'FAILED'}")
+    click.echo(f"Scenarios run: {len(results['scenarios'])}")
+    click.echo(f"Total tests: {results['total_tests']}")
+    click.echo(f"Passed: {results['total_passed']}")
+    click.echo(f"Failed: {results['total_failed']}")
+    
+    click.echo("\nScenario Details:")
+    for scenario in results['scenarios']:
+        status = 'PASS' if scenario.get('passed', False) else 'FAIL'
+        click.echo(f"  {Path(scenario['scenario_file']).name}: {status}")
+        if scenario.get('error'):
+            click.echo(f"    Error: {scenario['error']}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
